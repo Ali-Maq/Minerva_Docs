@@ -548,3 +548,695 @@ python /sc/arion/work/$USER/deploy_medgemma.py
 ```
 
 This completes Phase 2. Phase 3 will cover troubleshooting, alternative approaches analysis, and production optimization strategies.
+
+
+
+
+# PHASE 3: Troubleshooting, Optimization, and Production Considerations
+
+## Comprehensive Troubleshooting Guide
+
+### Common Failure Scenarios and Solutions
+
+#### 1. GPU Memory Issues
+
+**Symptom:**
+```
+RuntimeError: CUDA out of memory. Tried to allocate X.XX GiB
+```
+
+**Diagnostic Commands:**
+```bash
+# Check current GPU memory usage
+nvidia-smi
+
+# Check memory fragmentation
+python -c "
+import torch
+print(f'Allocated: {torch.cuda.memory_allocated(0)/1e9:.1f} GB')
+print(f'Cached: {torch.cuda.memory_reserved(0)/1e9:.1f} GB')
+print(f'Max allocated: {torch.cuda.max_memory_allocated(0)/1e9:.1f} GB')
+"
+
+# Detailed memory breakdown
+python -c "
+import torch
+print(torch.cuda.memory_summary(0))
+"
+```
+
+**Solutions by Priority:**
+```bash
+# 1. Clear GPU cache
+python -c "import torch; torch.cuda.empty_cache(); print('Cache cleared')"
+
+# 2. Force garbage collection
+python -c "import gc; gc.collect(); print('GC completed')"
+
+# 3. Kill other processes using GPU (if yours)
+nvidia-smi | grep python
+kill <PID>
+
+# 4. Restart with smaller model or reduced precision
+# Modify model loading in script:
+# torch_dtype=torch.float16  # Even smaller than bfloat16
+```
+
+**Prevention Strategy:**
+```python
+# Memory monitoring wrapper
+class GPUMemoryMonitor:
+    def __enter__(self):
+        torch.cuda.reset_peak_memory_stats()
+        self.start_memory = torch.cuda.memory_allocated()
+        return self
+    
+    def __exit__(self, *args):
+        peak_memory = torch.cuda.max_memory_allocated()
+        current_memory = torch.cuda.memory_allocated()
+        print(f"Peak GPU memory: {peak_memory/1e9:.1f} GB")
+        print(f"Memory increase: {(current_memory-self.start_memory)/1e9:.1f} GB")
+
+# Usage in script:
+with GPUMemoryMonitor():
+    model = load_model()
+    results = process_dataset()
+```
+
+#### 2. CUDA Context Conflicts
+
+**Symptom:**
+```
+RuntimeError: CUDA error: CUDA-capable device(s) is/are busy or unavailable
+```
+
+**Root Cause Analysis:**
+- Previous Python processes left CUDA contexts active
+- Multiple frameworks competing for GPU resources
+- Improper cleanup after model loading/unloading
+
+**Definitive Solution:**
+```bash
+# Create clean environment script
+cat > /sc/arion/work/$USER/clean_gpu_env.sh << 'EOF'
+#!/bin/bash
+# Nuclear option for CUDA cleanup
+
+# Kill all your Python processes
+pkill -f python -u $USER
+
+# Wait for cleanup
+sleep 5
+
+# Clear any remaining CUDA contexts
+python -c "
+import torch
+import gc
+# Clear all CUDA memory
+for i in range(torch.cuda.device_count()):
+    torch.cuda.set_device(i)
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
+gc.collect()
+print('All CUDA contexts cleared')
+"
+
+# Verify clean state
+nvidia-smi
+EOF
+
+chmod +x /sc/arion/work/$USER/clean_gpu_env.sh
+```
+
+#### 3. Network/Proxy Issues on GPU Nodes
+
+**Symptom:**
+```
+urllib3.exceptions.ProxyError: Unable to connect to proxy
+```
+
+**Diagnosis and Fix:**
+```bash
+# Test proxy configuration
+curl -I https://huggingface.co
+
+# If fails, set proxy variables:
+export http_proxy=http://172.28.7.1:3128
+export https_proxy=http://172.28.7.1:3128
+export all_proxy=http://172.28.7.1:3128
+export no_proxy=localhost,*.hpc.mssm.edu,*.chimera.hpc.mssm.edu,172.28.0.0/16
+
+# Test again
+curl -I https://huggingface.co
+
+# If still fails, use offline mode:
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+```
+
+### Why vLLM Failed and When It Might Work
+
+#### Technical Analysis of vLLM Failure
+
+**Memory Architecture Conflict:**
+```
+Standard Transformers:
+GPU Memory: [Model Weights][KV Cache][Workspace] - ~54GB total
+
+vLLM Architecture:
+GPU Memory: [Model Weights][PagedAttention Blocks][Request Pool][Worker Memory] - ~65GB total
+
+Conflict: After transformers loaded, memory was fragmented
+vLLM requires large contiguous blocks for PagedAttention
+Fragmented memory couldn't satisfy allocation requirements
+```
+
+**Process Management Issues:**
+```python
+# Why vLLM uses spawn instead of fork
+import multiprocessing
+
+# Fork method (default on Linux):
+# - Copies parent process memory (including CUDA contexts)
+# - CUDA contexts not copy-safe
+# - Results in corrupted GPU state
+
+# Spawn method (vLLM requirement):
+# - Creates fresh Python interpreter
+# - No memory inheritance from parent
+# - Requires clean GPU state to initialize
+```
+
+#### When vLLM Would Work
+
+**Ideal Conditions:**
+```bash
+# 1. Fresh Python process
+python -c "
+from vllm import LLM
+llm = LLM('google/medgemma-27b-text-it')  # Works when run first
+"
+
+# 2. Dedicated GPU node
+# Request node exclusively:
+bsub -P acc_xxx -q gpu -n 8 -R h100nvl -gpu num=4 -x -W 12:00 -Is /bin/bash
+
+# 3. Sufficient memory
+# vLLM needs ~20% more GPU memory than transformers
+# For 27B model: Need >65GB available (vs 54GB for transformers)
+```
+
+**vLLM Deployment Script (Alternative Approach):**
+```python
+# Only run if you have exclusive GPU access
+def deploy_with_vllm():
+    """
+    vLLM deployment - use only in fresh environment
+    
+    Advantages:
+    - 3-5x faster inference
+    - Better batching support
+    - Continuous batching for high throughput
+    
+    Requirements:
+    - Fresh Python process
+    - Clean GPU state
+    - >65GB GPU memory available
+    """
+    from vllm import LLM, SamplingParams
+    
+    # Configuration for reliability over speed
+    llm = LLM(
+        model='google/medgemma-27b-text-it',
+        tensor_parallel_size=1,
+        gpu_memory_utilization=0.85,  # Conservative memory usage
+        max_model_len=2048,           # Reduced context for stability
+        trust_remote_code=True,
+        download_dir='/sc/arion/work/$USER/hf_models'
+    )
+    
+    sampling_params = SamplingParams(
+        temperature=0.1,
+        max_tokens=10,
+        top_p=0.9
+    )
+    
+    return llm, sampling_params
+
+# Only use if environment is completely clean
+if __name__ == "__main__":
+    # Verify clean state first
+    import torch
+    if torch.cuda.memory_allocated(0) > 0:
+        raise RuntimeError("GPU not clean - use transformers approach")
+    
+    llm, params = deploy_with_vllm()
+```
+
+## Production Optimization Strategies
+
+### Performance Monitoring and Optimization
+
+#### Real-time Performance Tracking
+
+```python
+# Enhanced monitoring for production deployment
+import time
+import psutil
+import threading
+from collections import deque
+
+class ProductionMonitor:
+    """
+    Comprehensive monitoring for production inference
+    
+    Tracks:
+    - GPU utilization and memory
+    - CPU usage and system load
+    - Processing rates and latency
+    - Error rates and types
+    """
+    
+    def __init__(self, window_size=100):
+        self.window_size = window_size
+        self.reset_metrics()
+        self.monitoring = False
+        
+    def reset_metrics(self):
+        """Reset all tracking metrics"""
+        self.processing_times = deque(maxlen=self.window_size)
+        self.gpu_memory_usage = deque(maxlen=self.window_size)
+        self.error_count = 0
+        self.start_time = time.time()
+        
+    def start_monitoring(self):
+        """Start background monitoring thread"""
+        self.monitoring = True
+        self.monitor_thread = threading.Thread(target=self._monitor_loop)
+        self.monitor_thread.daemon = True
+        self.monitor_thread.start()
+        
+    def stop_monitoring(self):
+        """Stop monitoring and print summary"""
+        self.monitoring = False
+        if hasattr(self, 'monitor_thread'):
+            self.monitor_thread.join()
+        self.print_summary()
+        
+    def _monitor_loop(self):
+        """Background monitoring loop"""
+        import torch
+        while self.monitoring:
+            try:
+                # GPU monitoring
+                gpu_memory = torch.cuda.memory_allocated(0) / 1e9
+                self.gpu_memory_usage.append(gpu_memory)
+                
+                # System monitoring could be added here
+                time.sleep(1)
+            except Exception:
+                pass
+                
+    def record_processing_time(self, duration):
+        """Record time for processing one question"""
+        self.processing_times.append(duration)
+        
+    def record_error(self):
+        """Record an error occurrence"""
+        self.error_count += 1
+        
+    def get_current_stats(self):
+        """Get current performance statistics"""
+        if not self.processing_times:
+            return {}
+            
+        return {
+            'avg_processing_time': sum(self.processing_times) / len(self.processing_times),
+            'questions_per_second': len(self.processing_times) / (time.time() - self.start_time),
+            'avg_gpu_memory': sum(self.gpu_memory_usage) / len(self.gpu_memory_usage) if self.gpu_memory_usage else 0,
+            'error_rate': self.error_count / len(self.processing_times) if self.processing_times else 0,
+            'total_processed': len(self.processing_times)
+        }
+        
+    def print_summary(self):
+        """Print comprehensive performance summary"""
+        stats = self.get_current_stats()
+        print(f"\n{'='*60}")
+        print(f"PRODUCTION PERFORMANCE SUMMARY")
+        print(f"{'='*60}")
+        print(f"Total questions processed: {stats.get('total_processed', 0)}")
+        print(f"Average processing time: {stats.get('avg_processing_time', 0):.3f}s")
+        print(f"Questions per second: {stats.get('questions_per_second', 0):.2f}")
+        print(f"Average GPU memory: {stats.get('avg_gpu_memory', 0):.1f} GB")
+        print(f"Error rate: {stats.get('error_rate', 0):.2%}")
+```
+
+#### Memory Optimization Techniques
+
+```python
+def memory_optimized_inference(model, tokenizer, questions, batch_size=1):
+    """
+    Memory-optimized inference with dynamic batching
+    
+    Strategies:
+    - Gradient checkpointing to reduce memory
+    - Dynamic batching based on available memory
+    - Aggressive garbage collection
+    - Memory monitoring and adjustment
+    """
+    import torch
+    import gc
+    
+    # Enable memory optimizations
+    model.gradient_checkpointing_enable()
+    
+    results = []
+    
+    for i in range(0, len(questions), batch_size):
+        batch = questions[i:i + batch_size]
+        
+        # Check available memory before processing
+        available_memory = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated(0)
+        
+        # Adjust batch size if memory is low
+        if available_memory < 5e9:  # Less than 5GB available
+            if batch_size > 1:
+                batch_size = 1
+                batch = questions[i:i + 1]
+            
+            # Aggressive cleanup
+            torch.cuda.empty_cache()
+            gc.collect()
+        
+        # Process batch
+        try:
+            batch_results = process_batch(model, tokenizer, batch)
+            results.extend(batch_results)
+            
+        except torch.cuda.OutOfMemoryError:
+            # Fallback to single item processing
+            print(f"OOM at batch {i}, falling back to single processing")
+            for question in batch:
+                try:
+                    single_result = process_batch(model, tokenizer, [question])
+                    results.extend(single_result)
+                except Exception as e:
+                    print(f"Failed to process question {question.get('id', 'unknown')}: {e}")
+                    results.append(create_error_result(question, str(e)))
+                
+                # Cleanup after each question in fallback mode
+                torch.cuda.empty_cache()
+        
+        # Periodic cleanup
+        if (i + batch_size) % 50 == 0:
+            torch.cuda.empty_cache()
+            gc.collect()
+    
+    return results
+```
+
+## Alternative Deployment Strategies
+
+### Strategy 1: Multi-GPU Distribution
+
+```python
+def multi_gpu_deployment():
+    """
+    Distribute inference across multiple GPUs
+    
+    Use case: When multiple GPUs available
+    Benefit: Parallel processing of different questions
+    """
+    import torch.multiprocessing as mp
+    from torch.nn.parallel import DistributedDataParallel
+    
+    def worker_process(gpu_id, question_queue, result_queue):
+        """Worker process for single GPU"""
+        torch.cuda.set_device(gpu_id)
+        
+        # Load model on specific GPU
+        model, tokenizer = load_medgemma_model()
+        
+        while True:
+            try:
+                question = question_queue.get(timeout=10)
+                if question is None:  # Shutdown signal
+                    break
+                    
+                result = process_single_question(model, tokenizer, question)
+                result_queue.put(result)
+                
+            except Exception as e:
+                result_queue.put({'error': str(e), 'question_id': question.get('id', 'unknown')})
+    
+    # Only use if multiple GPUs available and not occupied
+    available_gpus = [i for i in range(torch.cuda.device_count()) 
+                      if torch.cuda.memory_allocated(i) == 0]
+    
+    if len(available_gpus) > 1:
+        print(f"Using multi-GPU deployment with {len(available_gpus)} GPUs")
+        # Implementation would continue here
+    else:
+        print("Falling back to single GPU deployment")
+```
+
+### Strategy 2: Model Sharding for Large Models
+
+```python
+def sharded_deployment():
+    """
+    Shard large model across multiple GPUs
+    
+    Use case: Model too large for single GPU
+    Implementation: Pipeline parallelism
+    """
+    from transformers import AutoModelForCausalLM
+    import torch
+    
+    # Example configuration for model sharding
+    device_map = {
+        'model.embed_tokens': 0,
+        'model.layers.0': 0,
+        'model.layers.1': 0,
+        # ... distribute layers across GPUs
+        'model.layers.26': 1,
+        'model.layers.27': 1,
+        'model.norm': 1,
+        'lm_head': 1
+    }
+    
+    model = AutoModelForCausalLM.from_pretrained(
+        'google/medgemma-27b-text-it',
+        device_map=device_map,  # Automatic sharding
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True
+    )
+    
+    return model
+```
+
+### Strategy 3: Quantized Deployment
+
+```python
+def quantized_deployment():
+    """
+    Deploy with model quantization for memory efficiency
+    
+    Benefits:
+    - Reduces memory usage by 50-75%
+    - Allows larger batch sizes
+    - Slight accuracy trade-off
+    """
+    from transformers import BitsAndBytesConfig
+    
+    # 8-bit quantization configuration
+    bnb_config = BitsAndBytesConfig(
+        load_in_8bit=True,
+        bnb_8bit_compute_dtype=torch.bfloat16,
+        bnb_8bit_quant_type="nf8",
+        bnb_8bit_use_double_quant=True
+    )
+    
+    model = AutoModelForCausalLM.from_pretrained(
+        'google/medgemma-27b-text-it',
+        quantization_config=bnb_config,
+        device_map='auto',
+        trust_remote_code=True
+    )
+    
+    print(f"Quantized model memory: {torch.cuda.memory_allocated(0) / 1e9:.1f} GB")
+    return model
+```
+
+## Production Checklist and Best Practices
+
+### Pre-deployment Validation
+
+```bash
+# Create comprehensive pre-deployment check
+cat > /sc/arion/work/$USER/pre_deployment_check.sh << 'EOF'
+#!/bin/bash
+# Production deployment validation checklist
+
+echo "=== MINERVA DEPLOYMENT VALIDATION ==="
+
+# 1. Environment validation
+echo "1. Checking environment..."
+if [[ -z "$HF_TOKEN" ]]; then
+    echo "❌ HF_TOKEN not set"
+    exit 1
+else
+    echo "✅ HF_TOKEN configured"
+fi
+
+if [[ -z "$CUDA_VISIBLE_DEVICES" ]]; then
+    echo "❌ CUDA_VISIBLE_DEVICES not set"
+    exit 1
+else
+    echo "✅ CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
+fi
+
+# 2. GPU availability
+echo "2. Checking GPU..."
+python -c "
+import torch
+if not torch.cuda.is_available():
+    print('❌ CUDA not available')
+    exit(1)
+print(f'✅ CUDA available: {torch.cuda.get_device_name(0)}')
+print(f'✅ GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB')
+memory_used = torch.cuda.memory_allocated(0)
+if memory_used > 1e9:
+    print(f'⚠️  GPU memory in use: {memory_used / 1e9:.1f} GB')
+else:
+    print('✅ GPU memory clean')
+"
+
+# 3. Network connectivity
+echo "3. Checking network..."
+if curl -s --max-time 10 -I https://huggingface.co > /dev/null; then
+    echo "✅ HuggingFace accessible"
+else
+    echo "❌ HuggingFace not accessible - check proxy"
+    exit 1
+fi
+
+# 4. Storage space
+echo "4. Checking storage..."
+work_space=$(df /sc/arion/work/$USER | tail -1 | awk '{print $4}')
+if [[ $work_space -lt 50000000 ]]; then  # 50GB in KB
+    echo "❌ Insufficient work directory space: ${work_space}KB"
+    exit 1
+else
+    echo "✅ Work directory space available: $((work_space/1000000))GB"
+fi
+
+# 5. Dataset availability
+echo "5. Checking dataset..."
+if [[ -f "/sc/arion/work/$USER/curebench_testset_phase1.jsonl" ]]; then
+    dataset_size=$(wc -l < "/sc/arion/work/$USER/curebench_testset_phase1.jsonl")
+    echo "✅ Dataset found: $dataset_size questions"
+else
+    echo "❌ Dataset not found"
+    exit 1
+fi
+
+echo "=== ALL CHECKS PASSED - READY FOR DEPLOYMENT ==="
+EOF
+
+chmod +x /sc/arion/work/$USER/pre_deployment_check.sh
+```
+
+### Post-deployment Analysis
+
+```python
+def post_deployment_analysis(results_dir):
+    """
+    Analyze deployment results for quality and performance insights
+    
+    Generates:
+    - Performance metrics
+    - Error analysis
+    - Quality assessment
+    - Recommendations for improvement
+    """
+    import pandas as pd
+    import json
+    from pathlib import Path
+    
+    results_path = Path(results_dir)
+    
+    # Load results
+    df = pd.read_csv(results_path / "submission.csv")
+    
+    with open(results_path / "meta_data.json") as f:
+        metadata = json.load(f)
+    
+    analysis = {
+        'performance': {
+            'total_questions': len(df),
+            'questions_per_second': metadata['meta_data']['questions_per_second'],
+            'total_time_minutes': metadata['meta_data']['total_time_seconds'] / 60
+        },
+        'quality': {
+            'valid_choices': len(df[df['choice'].isin(['A', 'B', 'C', 'D', 'E'])]),
+            'invalid_choices': len(df[df['choice'] == 'NOTAVALUE']),
+            'error_rate': len(df[df['choice'] == 'NOTAVALUE']) / len(df)
+        },
+        'recommendations': []
+    }
+    
+    # Generate recommendations
+    if analysis['quality']['error_rate'] > 0.05:  # >5% error rate
+        analysis['recommendations'].append(
+            "High error rate detected. Consider model fine-tuning or prompt optimization."
+        )
+    
+    if analysis['performance']['questions_per_second'] < 1.5:
+        analysis['recommendations'].append(
+            "Low throughput detected. Consider GPU optimization or model quantization."
+        )
+    
+    # Save analysis
+    with open(results_path / "deployment_analysis.json", 'w') as f:
+        json.dump(analysis, f, indent=2)
+    
+    print("Post-deployment Analysis:")
+    print(f"Performance: {analysis['performance']['questions_per_second']:.2f} q/s")
+    print(f"Quality: {analysis['quality']['error_rate']:.1%} error rate")
+    print(f"Recommendations: {len(analysis['recommendations'])} items")
+    
+    return analysis
+```
+
+## Future Improvements and Scaling
+
+### Scaling Strategies
+
+1. **Horizontal Scaling**: Multiple GPU nodes processing different subsets
+2. **Model Optimization**: Distillation, pruning, quantization
+3. **Infrastructure**: Dedicated inference clusters
+4. **Caching**: Result caching for repeated questions
+
+### Next Steps for Production
+
+```python
+# Production deployment template
+def production_template():
+    """
+    Template for production-ready deployment
+    
+    Features:
+    - Comprehensive error handling
+    - Performance monitoring
+    - Automatic recovery
+    - Result validation
+    - Logging and alerting
+    """
+    
+    # This would be a full production implementation
+    # with enterprise-grade reliability features
+    pass
+```
+
+This completes the comprehensive three-phase guide covering everything from initial setup through production deployment and optimization strategies.
