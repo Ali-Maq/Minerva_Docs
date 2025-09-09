@@ -1,0 +1,577 @@
+# CURE-Bench Comprehensive Testing System Design
+
+## System Architecture Overview
+
+```mermaid
+flowchart TD
+    %% Data Input Layer
+    A[Raw CURE-Bench Dataset] --> B[Data Preparation Module]
+    A1[curebench_valset_pharse1.jsonl<br/>459 questions] --> B
+    A2[curebench_testset_phase1.jsonl<br/>2079 questions] --> B
+    
+    %% Data Preparation
+    B --> C[Stratified Sampling]
+    C --> D[Question Type Detection]
+    D --> E[Data Classification & Labeling]
+    
+    %% Configuration Layer
+    F[Model Configuration] --> G[Model Interface Setup]
+    F1[cure_bench_modular_models.json<br/>12 Models] --> F
+    
+    %% Processing Pipeline
+    E --> H[Prompt Generation Engine]
+    G --> H
+    H --> I[Model Execution Layer]
+    I --> J[Response Processing]
+    J --> K[Evaluation & Scoring]
+    K --> L[Results Analysis]
+    L --> M[Comprehensive Reporting]
+    
+    %% Output Layer
+    M --> N[JSON Results Files]
+    M --> O[CSV Summaries]
+    M --> P[Performance Visualizations]
+    
+    style A fill:#e1f5fe
+    style F fill:#f3e5f5
+    style H fill:#fff3e0
+    style K fill:#e8f5e8
+    style M fill:#fce4ec
+```
+
+---
+
+## Phase 1: Data Preparation & Classification
+
+### 1.1 Raw Data Input
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     CURE-Bench Raw Datasets                    │
+├─────────────────────────────────────────────────────────────────┤
+│ Validation Set: 459 questions                                  │
+│ ├── multi_choice: 183 questions                               │
+│ ├── open_ended_multi_choice: 230 questions                    │
+│ └── open_ended: 46 questions ⚠️ (MISLABELED - have answers!)  │
+│                                                                 │
+│ Test Set: 2079 questions                                       │
+│ ├── multi_choice: 663 questions                               │
+│ ├── open_ended_multi_choice: 1274 questions                   │
+│ └── open_ended: 142 questions (truly open-ended)              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 1.2 Stratified Sampling Strategy
+```python
+def create_stratified_sample():
+    """
+    Creates balanced sample for fair model comparison
+    - 5 multi_choice questions
+    - 5 open_ended_multi_choice questions  
+    - 5 open_ended questions (validation set)
+    
+    Ensures each model tested on same question mix
+    """
+```
+
+### 1.3 Question Type Detection & Classification
+
+```mermaid
+flowchart LR
+    A[Raw Question] --> B{Has Options?}
+    B -->|Yes| C{Has Correct Answer?}
+    B -->|No| D[True Open-Ended]
+    
+    C -->|Yes| E{Original Type?}
+    C -->|No| F[Test Set Open-Ended]
+    
+    E -->|"multi_choice"| G[Standard MC]
+    E -->|"open_ended_multi_choice"| H[Two-Step Process]
+    E -->|"open_ended"| I[⚠️ Validation Mislabeled<br/>Treat as MC]
+    
+    style I fill:#ffeb3b
+    style G fill:#4caf50
+    style H fill:#2196f3
+    style D fill:#ff9800
+```
+
+**Key Discovery**: Validation set "open_ended" questions are actually multiple choice questions with correct answers - they're mislabeled!
+
+---
+
+## Phase 2: Model Configuration & Setup
+
+### 2.1 Model Registry & Configuration
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    12 Model Configuration Matrix                │
+├─────────────────────────────────────────────────────────────────┤
+│ Provider: Fireworks API (11 models)                            │
+│ ├── Llama Family: 3.3-70B, 3.1-70B, 3.1-8B                   │
+│ ├── DeepSeek Family: V3, V3.1, R1                             │
+│ ├── GPT-OSS Family: 120B, 20B                                 │
+│ ├── Others: Mixtral-8x22B, Kimi-K2, Qwen3-30B, GLM-4.5       │
+│                                                                 │
+│ Provider: Ollama Local (1 model)                               │
+│ └── MedGemma-27B (Medical specialized)                         │
+│                                                                 │
+│ Response Format Variations:                                     │
+│ ├── Standard: "content" field                                  │
+│ ├── GPT-OSS: "reasoning_content" field                         │
+│ └── DeepSeek R1: "content" with <think> tags                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 Model Interface Architecture
+
+```mermaid
+classDiagram
+    class ModelInterface {
+        +config: ModelConfig
+        +session: requests.Session
+        +call_model(prompt): Tuple
+        -_call_fireworks()
+        -_call_ollama()
+    }
+    
+    class ModelConfig {
+        +model_id: str
+        +name: str
+        +input_price: float
+        +output_price: float
+        +provider: str
+        +response_format: str
+    }
+    
+    ModelInterface --> ModelConfig
+    ModelInterface --> FireworksAPI
+    ModelInterface --> OllamaAPI
+    
+    class FireworksAPI {
+        +endpoint: str
+        +auth: Bearer Token
+        +unlimited_tokens: bool
+    }
+    
+    class OllamaAPI {
+        +endpoint: localhost:11434
+        +local_inference: bool
+        +cost: $0.00
+    }
+```
+
+---
+
+## Phase 3: Intelligent Prompt Generation
+
+### 3.1 Question Type Processing Matrix
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                  Prompt Generation Strategy                     │
+├─────────────────────────────────────────────────────────────────┤
+│ Multi-Choice (Standard):                                        │
+│ ├── Input: Question + Options A-E                              │
+│ ├── Prompt: "Analyze and end with 'The answer is X'"           │
+│ └── Steps: 1 (Direct choice extraction)                        │
+│                                                                 │
+│ Open-Ended Multi-Choice (Two-Step):                            │
+│ ├── Step 1: Question ONLY (no options shown)                   │
+│ ├── Step 2: Map response to options A-E                        │
+│ └── Steps: 2 (Reasoning → Choice mapping)                      │
+│                                                                 │
+│ Validation "Open-Ended" (Mislabeled):                          │
+│ ├── Input: Question + Options A-E (treat as MC)                │
+│ ├── Prompt: "This is multiple choice, end with answer"         │
+│ └── Steps: 1 (Direct choice extraction)                        │
+│                                                                 │
+│ True Open-Ended:                                                │
+│ ├── Input: Question only                                        │
+│ ├── Prompt: "Provide comprehensive clinical answer"            │
+│ └── Steps: 1 (Free-form response)                              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 3.2 Prompt Templates
+
+**Multi-Choice Prompt Template:**
+```
+You are a medical expert. Analyze this question carefully and provide your reasoning. 
+End your response by clearly stating 'The answer is X' where X is the correct letter.
+
+Question: {question_text}
+A: {option_a}
+B: {option_b}
+C: {option_c}
+D: {option_d}
+
+Provide your detailed analysis and final answer:
+```
+
+**Open-Ended MC Step 1 Template:**
+```
+You are a medical expert. Provide a comprehensive, evidence-based answer to this 
+clinical question. Do not guess - use your medical knowledge.
+
+Question: {question_text}
+
+Provide your detailed medical analysis:
+```
+
+**Open-Ended MC Step 2 Template:**
+```
+Based on this medical analysis, determine which option best matches. 
+End with 'The answer is X' where X is the correct letter.
+
+Original Question: {question_text}
+A: {option_a}
+B: {option_b}
+C: {option_c}
+D: {option_d}
+
+Medical Analysis: {step1_response}
+
+Which option best matches this analysis?
+```
+
+---
+
+## Phase 4: Model Execution & API Management
+
+### 4.1 API Call Architecture
+
+```mermaid
+sequenceDiagram
+    participant System
+    participant ModelInterface
+    participant FireworksAPI
+    participant OllamaAPI
+    participant Cache
+    
+    System->>ModelInterface: call_model(prompt)
+    ModelInterface->>Cache: check_cache(prompt_hash)
+    
+    alt Cache Hit
+        Cache-->>ModelInterface: cached_response
+    else Cache Miss - Fireworks
+        ModelInterface->>FireworksAPI: POST /chat/completions
+        Note right of FireworksAPI: {<br/>"model": model_id,<br/>"messages": [prompt],<br/>"temperature": 0.1<br/>}
+        FireworksAPI-->>ModelInterface: response + tokens + cost
+        ModelInterface->>Cache: store_response(hash, data)
+    else Cache Miss - Ollama  
+        ModelInterface->>OllamaAPI: POST /api/generate
+        OllamaAPI-->>ModelInterface: response (local, free)
+        ModelInterface->>Cache: store_response(hash, data)
+    end
+    
+    ModelInterface-->>System: (content, tokens, cost, success, time)
+```
+
+### 4.2 Token Management Strategy
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Token Management Principles                  │
+├─────────────────────────────────────────────────────────────────┤
+│ ❌ FAILED APPROACH:                                             │
+│ └── max_tokens: 100-500 → Truncated reasoning mid-sentence     │
+│                                                                 │
+│ ✅ WORKING APPROACH:                                            │
+│ ├── NO max_tokens parameter → Unlimited reasoning              │
+│ ├── Let models complete their thoughts fully                   │
+│ └── Extract choices from complete responses                     │
+│                                                                 │
+│ RESULTS:                                                        │
+│ ├── DeepSeek R1: 15% → 90% accuracy after removing limits     │
+│ ├── GPT-OSS models: Complete reasoning chains                  │
+│ └── All models: Better choice extraction                       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Phase 5: Advanced Response Processing
+
+### 5.1 Model-Specific Content Extraction
+
+```python
+def extract_content_by_model_type(message, model_id):
+    """
+    Critical: Different models return content in different fields
+    """
+    if 'gpt-oss' in model_id.lower():
+        # GPT-OSS models use reasoning_content
+        return message.get("reasoning_content", "")
+    elif 'deepseek-r1' in model_id.lower():
+        # DeepSeek R1 uses content with <think> tags
+        content = message.get("content", "")
+        if '<think>' in content and '</think>' in content:
+            return content.split('</think>')[-1].strip()
+        return content
+    else:
+        # Standard models use content
+        return message.get("content", "")
+```
+
+### 5.2 Advanced Choice Extraction Engine
+
+```mermaid
+flowchart TD
+    A[Raw Model Response] --> B{Contains <think> tags?}
+    B -->|Yes| C[Extract content after </think>]
+    B -->|No| D[Use full response]
+    
+    C --> E[Apply Pattern Matching]
+    D --> E
+    
+    E --> F[High Confidence Patterns]
+    F --> G["The answer is X" - 90% confidence]
+    F --> H["X is correct" - 80% confidence]
+    
+    E --> I[Medium Confidence Patterns]
+    I --> J["Option X" - 60% confidence]
+    I --> K["X:" - 50% confidence]
+    
+    E --> L[Low Confidence Patterns]
+    L --> M[Isolated letter - 30% confidence]
+    
+    G --> N{Match Found?}
+    H --> N
+    J --> N
+    K --> N
+    M --> N
+    
+    N -->|Yes| O[Return Choice + Confidence]
+    N -->|No| P[Return NOTAVALUE]
+    
+    style G fill:#4caf50
+    style P fill:#f44336
+```
+
+### 5.3 Confidence Scoring Algorithm
+
+```python
+confidence_patterns = [
+    # High confidence (explicit statements)
+    (r"(?:THE ANSWER IS|ANSWER IS)\s*([ABCDE])", 0.9),
+    (r"(?:I CHOOSE|I SELECT)\s*([ABCDE])", 0.8),
+    
+    # Medium confidence (structured responses)
+    (r"(?:OPTION|CHOICE)\s*([ABCDE])", 0.6),
+    (r"([ABCDE])\s*[:\-\.]", 0.5),
+    
+    # Low confidence (fallback)
+    (r"\b([ABCDE])\b", 0.3)
+]
+```
+
+---
+
+## Phase 6: Comprehensive Evaluation & Scoring
+
+### 6.1 Multi-Dimensional Evaluation Matrix
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Evaluation Dimensions                        │
+├─────────────────────────────────────────────────────────────────┤
+│ 1. ACCURACY METRICS:                                            │
+│    ├── Overall Accuracy (evaluable questions only)             │
+│    ├── By Question Type (multi_choice, open_ended_MC, etc.)    │
+│    ├── Confidence-Weighted Accuracy                            │
+│    └── Error Pattern Analysis                                   │
+│                                                                 │
+│ 2. COST METRICS:                                                │
+│    ├── Total Cost (input_tokens × input_price + output × output)│
+│    ├── Cost per Question                                        │
+│    ├── Cost per Correct Answer                                  │
+│    └── Cost Efficiency (accuracy / cost)                       │
+│                                                                 │
+│ 3. TOKEN METRICS:                                               │
+│    ├── Total Tokens (input + output)                           │
+│    ├── Average Tokens per Question                              │
+│    ├── Token Efficiency (accuracy / tokens)                    │
+│    └── Reasoning Verbosity Analysis                            │
+│                                                                 │
+│ 4. PERFORMANCE METRICS:                                         │
+│    ├── Processing Time per Question                             │
+│    ├── API Success Rate                                         │
+│    ├── Error Recovery Rate                                      │
+│    └── Two-Step Process Success Rate                            │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 6.2 Evaluation Rules & Logic
+
+```python
+def evaluate_response(extracted_choice, correct_answer, question_type):
+    """
+    Evaluation Rules:
+    1. Only evaluate questions with ground truth answers
+    2. Exact string match: extracted_choice == correct_answer
+    3. No partial credit given
+    4. NOTAVALUE = incorrect
+    5. Track confidence for quality assessment
+    """
+    
+    # Skip evaluation for true open-ended questions
+    if correct_answer in ["N/A", "", "False", None]:
+        return None  # Not evaluable
+    
+    # Exact match evaluation
+    is_correct = (extracted_choice == str(correct_answer))
+    
+    return {
+        "is_correct": is_correct,
+        "extracted": extracted_choice,
+        "correct": correct_answer,
+        "evaluable": True
+    }
+```
+
+---
+
+## Phase 7: Results Analysis & Reporting
+
+### 7.1 Comprehensive Metrics Calculation
+
+```mermaid
+flowchart LR
+    A[Raw Results] --> B[Filter Evaluable Questions]
+    B --> C[Calculate Overall Accuracy]
+    B --> D[Group by Question Type]
+    
+    D --> E[Multi-Choice Analysis]
+    D --> F[Open-Ended MC Analysis]
+    D --> G[Validation Set Analysis]
+    
+    E --> H[Section-Wise Metrics]
+    F --> H
+    G --> H
+    
+    H --> I[Cost Analysis]
+    H --> J[Token Analysis]
+    H --> K[Confidence Analysis]
+    
+    I --> L[Comprehensive Report]
+    J --> L
+    K --> L
+    
+    style L fill:#4caf50
+```
+
+### 7.2 Performance Analysis Framework
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                  Model Performance Analysis                     │
+├─────────────────────────────────────────────────────────────────┤
+│ ACCURACY BREAKDOWN:                                             │
+│ ├── Multi-Choice: Direct choice extraction difficulty          │
+│ │   └── Range: 20%-80% (most challenging)                      │
+│ ├── Open-Ended MC: Two-step process success                    │
+│ │   └── Range: 80%-100% (most successful)                      │
+│ └── Validation Open-Ended: Mislabeling impact                  │
+│     └── Before fix: 0% | After fix: 40%-80%                    │
+│                                                                 │
+│ COST-PERFORMANCE ANALYSIS:                                      │
+│ ├── Budget Tier: Llama 3.1 8B ($0.003, 70% acc)              │
+│ ├── Value Tier: Llama 3.1 70B ($0.013, 80% acc)              │
+│ ├── Premium Tier: DeepSeek R1 ($0.228, 90% acc)              │
+│ └── Specialized: MedGemma 27B ($0.000, 70% acc)               │
+│                                                                 │
+│ TOKEN EFFICIENCY:                                               │
+│ ├── Most Efficient: Kimi K2 (10.5K tokens, 80% acc)          │
+│ ├── Most Verbose: GLM-4.5-Air (40.5K tokens, 60% acc)        │
+│ └── Reasoning Models: 25K-40K tokens (detailed thinking)      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Phase 8: Progressive Testing Strategy
+
+### 8.1 Three-Stage Testing Pipeline
+
+```mermaid
+graph TD
+    A[Stage 1: Initial Test] --> B{All Models Work?}
+    B -->|Yes| C[Stage 2: Small Scale]
+    B -->|No| D[Debug Failed Models]
+    
+    C --> E[5 Questions × 12 Models]
+    E --> F{Results Satisfactory?}
+    F -->|Yes| G[Stage 3: Full Dataset]
+    F -->|No| H[Analyze Issues]
+    
+    G --> I[15 Questions × 12 Models]
+    I --> J[Complete Analysis]
+    
+    D --> K[Fix Configuration]
+    K --> A
+    
+    H --> L[Adjust Parameters]
+    L --> C
+    
+    style A fill:#fff3e0
+    style C fill:#e3f2fd
+    style G fill:#e8f5e8
+    style J fill:#f3e5f5
+```
+
+### 8.2 Quality Gates & Validation
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     Quality Gates                               │
+├─────────────────────────────────────────────────────────────────┤
+│ STAGE 1 VALIDATION:                                             │
+│ ├── ✅ All models can connect to APIs                          │
+│ ├── ✅ Response parsing works correctly                        │
+│ ├── ✅ Choice extraction succeeds                              │
+│ └── ✅ Cost calculation accurate                               │
+│                                                                 │
+│ STAGE 2 VALIDATION:                                             │
+│ ├── ✅ Question type handling correct                          │
+│ ├── ✅ Two-step process works                                  │
+│ ├── ✅ Section-wise accuracy reasonable                        │
+│ └── ✅ No systematic failures                                  │
+│                                                                 │
+│ STAGE 3 VALIDATION:                                             │
+│ ├── ✅ Full dataset coverage                                   │
+│ ├── ✅ Comprehensive metrics                                   │
+│ ├── ✅ Comparative analysis complete                           │
+│ └── ✅ Results export successful                               │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Critical Insights & Lessons Learned
+
+### System Design Principles
+
+1. **Progressive Validation**: Test 1 → 5 → All questions to catch issues early
+2. **Robust Error Handling**: Continue processing if individual models fail
+3. **Model-Specific Adaptations**: Handle different response formats automatically
+4. **Cost Consciousness**: Track exact costs and provide cost/performance analysis
+5. **Question Type Intelligence**: Detect and handle validation set mislabeling
+6. **Comprehensive Evaluation**: Multi-dimensional performance assessment
+
+### Technical Breakthroughs
+
+1. **Token Limit Discovery**: Removing max_tokens dramatically improved reasoning model performance
+2. **Response Format Detection**: Automatic handling of content vs reasoning_content fields
+3. **Validation Set Issue**: Identified mislabeled "open_ended" questions with ground truth
+4. **Choice Extraction**: Advanced pattern matching with confidence scoring
+5. **Cost Optimization**: Precise token tracking and cost-per-accuracy analysis
+
+### Performance Insights
+
+1. **Best Overall**: DeepSeek R1 (90% accuracy, expensive)
+2. **Best Value**: Llama 3.1 70B (80% accuracy, reasonable cost)
+3. **Most Efficient**: Kimi K2 (80% accuracy, lowest token usage)
+4. **Specialized**: MedGemma 27B (70% accuracy, free local inference)
+5. **Challenge Areas**: Multi-choice questions harder than two-step reasoning
+
+This comprehensive system design enables fair, robust, and insightful evaluation of medical reasoning capabilities across diverse model architectures and pricing tiers.
