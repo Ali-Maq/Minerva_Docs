@@ -130,6 +130,12 @@ pip install transformers huggingface-hub accelerate bitsandbytes pandas tqdm
 bsub -P acc_pareks02a -q gpu -n 8 -R h100nvl -gpu num=1 -W 12:00 -R span[hosts=1] -R rusage[mem=16000] -Is /bin/bash
 ```
 
+
+How to log in the GPU node once its allocated 
+
+hostname
+
+
 ### Step 4: Environment Configuration on GPU Node
 
 ```bash
